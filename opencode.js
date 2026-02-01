@@ -1,10 +1,13 @@
 /**
  * OpenCode Skill - 使用 OpenCode AI 编码代理进行软件开发
  * 
- * 最佳实践：通过 tmux 交互式会话调用 OpenCode（不是直接 exec run）
+ * 最佳实践：通过 tmux attach 模式调用 OpenCode
+ * - 用户可以看到 OpenCode 窗口
+ * - 子代理可以自动化管理任务
  * 
  * 工具函数：
- * - opencode_run: 使用 tmux 交互式会话运行 OpenCode 任务
+ * - opencode_run: 使用 tmux attach 模式运行 OpenCode 任务
+ * - opencode_attach: attach 到会话查看进度
  * - opencode_status: 检查任务状态
  * - opencode_kill: 终止任务
  * - opencode_send: 发送输入（如确认信息）
@@ -24,7 +27,8 @@ const SESSION_PREFIX = "opencode-";
 // ============================================================================
 
 /**
- * 在 tmux 会话中运行 OpenCode 任务（交互式方式）
+ * 在 tmux attach 会话中运行 OpenCode 任务
+ * 用户可以看到窗口，子代理可以自动化管理
  * 
  * @param {Object} args
  * @param {string} args.command - 要执行的开发任务描述
@@ -49,68 +53,24 @@ async function opencode_run(args) {
   }
 
   try {
-    // 1. 创建 tmux 会话（后台运行）
+    // 1. 创建 tmux 会话（attach 模式，用户能看到窗口）
     await exec({
-      command: `tmux new-session -d -s ${sessionId} "${opencodeCmd}"`,
+      command: `tmux new-session -s ${sessionId} "${opencodeCmd}"`,
       security: "allowlist"
     })
 
-    // 2. 等待任务完成（轮询检查输出）
-    const startTime = Date.now()
-    let output = ""
-    let isComplete = false
-
-    while (Date.now() - startTime < DEFAULT_TIMEOUT && !isComplete) {
-      await sleep(3000) // 每3秒检查一次
-
-      // 捕获 tmux 输出
-      const result = await exec({
-        command: `tmux capture-pane -p -t ${sessionId} -S -50`,
-        security: "allowlist"
-      })
-
-      output = result.stdout || ""
-
-      // 检查是否完成（看到 OpenCode 提示符）
-      if (output.includes("❯") || output.includes("›")) {
-        isComplete = true
-      }
-
-      // 检查是否出错
-      if (output.toLowerCase().includes("error") && !output.includes("noReply")) {
-        isComplete = true
-      }
-    }
-
-    // 3. 获取最终输出
-    const finalResult = await exec({
-      command: `tmux capture-pane -p -t ${sessionId} -S -100`,
-      security: "allowlist"
-    })
-
-    // 4. 清理 tmux 会话
-    await exec({
-      command: `tmux kill-session -t ${sessionId} 2>/dev/null || true`,
-      security: "allowlist"
-    })
-
-    // 5. 解析输出
-    const cleanedOutput = cleanOutput(finalResult.stdout || "")
-
+    // 返回 attach 命令，让用户可以查看
     return {
-      success: !cleanedOutput.toLowerCase().includes("error"),
+      success: true,
       session_id: sessionId,
-      output: cleanedOutput,
-      truncated: cleanedOutput.length > 10000
+      message: `任务已在 tmux 会话 ${sessionId} 中启动`,
+      attach_command: `tmux attach -t ${sessionId}`,
+      hint: "执行 tmux attach -t ${sessionId} 查看窗口",
+      output: "",
+      truncated: false
     }
 
   } catch (error) {
-    // 清理 tmux 会话
-    await exec({
-      command: `tmux kill-session -t ${sessionId} 2>/dev/null || true`,
-      security: "allowlist"
-    })
-
     return {
       success: false,
       error: error.message,
@@ -125,7 +85,7 @@ async function opencode_run(args) {
 // ============================================================================
 
 /**
- * 在后台启动 OpenCode 任务（不等待完成）
+ * 在后台启动 OpenCode 任务（attach 模式，用户能看到窗口）
  * 
  * @param {Object} args
  * @param {string} args.command - 要执行的开发任务描述
@@ -139,9 +99,9 @@ async function opencode_background(args) {
   const opencodeCmd = `cd "${directory}" && opencode run "${command.replace(/"/g, '\\"')}"`
 
   try {
-    // 创建 tmux 会话
+    // 创建 tmux 会话（attach 模式）
     await exec({
-      command: `tmux new-session -d -s ${sessionId} "${opencodeCmd}"`,
+      command: `tmux new-session -s ${sessionId} "${opencodeCmd}"`,
       security: "allowlist"
     })
 
@@ -149,7 +109,8 @@ async function opencode_background(args) {
       success: true,
       session_id: sessionId,
       message: `任务已在 tmux 会话 ${sessionId} 中启动`,
-      hint: "使用 opencode_status 检查进度，使用 opencode_output 获取输出"
+      attach_command: `tmux attach -t ${sessionId}`,
+      hint: "执行 tmux attach -t ${sessionId} 查看窗口"
     }
 
   } catch (error) {
@@ -158,6 +119,56 @@ async function opencode_background(args) {
       error: error.message,
       hint: "确保 tmux 已安装"
     }
+  }
+}
+
+// ============================================================================
+// Tool: opencode_attach
+// ============================================================================
+
+/**
+ * Attach 到正在运行的 OpenCode 会话
+ * 
+ * @param {Object} args
+ * @param {string} args.session_id - tmux 会话 ID（可选，默认最后一个）
+ * @returns {Promise<Object>}
+ */
+async function opencode_attach(args) {
+  const { session_id = null } = args
+
+  let targetSession = session_id
+
+  // 如果没有指定，查找最后一个会话
+  if (!targetSession) {
+    try {
+      const result = await exec({
+        command: `tmux list-sessions -F "#{session_name}" 2>/dev/null | grep ${SESSION_PREFIX} | tail -1`,
+        security: "allowlist"
+      })
+      targetSession = result.stdout.trim()
+    } catch {
+      return {
+        success: false,
+        error: "未找到运行中的 OpenCode 会话",
+        hint: "使用 opencode_run 或 opencode_background 先启动任务"
+      }
+    }
+  }
+
+  if (!targetSession) {
+    return {
+      success: false,
+      error: "未找到运行中的 OpenCode 会话",
+      hint: "使用 opencode_run 或 opencode_background 先启动任务"
+    }
+  }
+
+  return {
+    success: true,
+    session_id: targetSession,
+    attach_command: `tmux attach -t ${targetSession}`,
+    hint: "执行 tmux attach -t ${targetSession} 查看窗口",
+    manual_attach: "或者直接开新的 Terminal 执行上述命令"
   }
 }
 
@@ -377,6 +388,7 @@ function sleep(ms) {
 export const tools = {
   opencode_run,
   opencode_background,
+  opencode_attach,
   opencode_status,
   opencode_output,
   opencode_send,
@@ -386,8 +398,8 @@ export const tools = {
 
 export const skill = {
   name: "opencode",
-  description: "使用 OpenCode AI 编码代理进行软件开发（通过 tmux 交互式会话）",
-  version: "2.0.0",
+  description: "使用 OpenCode AI 编码代理进行软件开发（通过 tmux attach 模式）",
+  version: "2.2.0",
   author: "Clawdbot",
   
   triggers: [
@@ -404,7 +416,8 @@ export const skill = {
     model: null,
     directory: process.cwd(),
     timeout: 300000,
-    use_tmux: true
+    use_tmux: true,
+    tmux_mode: "attach"  // 改为 attach 模式
   },
   
   info: {
@@ -412,6 +425,12 @@ export const skill = {
       "安装 OpenCode CLI: curl -fsSL https://opencode.ai/install | bash",
       "配置 API Key: opencode auth login",
       "安装 tmux（系统包管理器）"
+    ],
+    usage: [
+      "1. 使用 opencode_run 或 opencode_background 启动任务",
+      "2. 用户执行 tmux attach -t <session_id> 查看窗口",
+      "3. 子代理可以使用 opencode_status 检查状态",
+      "4. 任务完成后使用 opencode_kill 清理会话"
     ]
   }
 }

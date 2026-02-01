@@ -166,6 +166,29 @@ tmux attach -t opencode-task
 - 用 `opencode_output` 获取输出
 - 用 `opencode_kill` 终止任务
 
+### opencode_attach
+
+**Attach 到正在运行的 OpenCode 会话**。这是关键功能，让用户能够实时看到 OpenCode 窗口！
+
+**输入参数**：
+- `session_id`: tmux 会话 ID（可选，默认最后一个 opencode 会话）
+
+**返回**：
+- `session_id`: tmux 会话 ID
+- `attach_command`: attach 命令
+- `hint`: 操作提示
+
+**示例**：
+```bash
+# 返回结果示例
+{
+  "success": true,
+  "session_id": "opencode-123456",
+  "attach_command": "tmux attach -t opencode-123456",
+  "hint": "执行 tmux attach -t opencode-123456 查看窗口"
+}
+```
+
 ### opencode_status
 
 检查任务状态。
