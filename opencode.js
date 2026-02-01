@@ -1,313 +1,373 @@
 /**
  * OpenCode Skill - 使用 OpenCode AI 编码代理进行软件开发
  * 
+ * 最佳实践：通过 tmux 交互式会话调用 OpenCode（不是直接 exec run）
+ * 
  * 工具函数：
- * - opencode_run: 运行 OpenCode 开发任务
- * - opencode_session: 管理 OpenCode 会话
- * - opencode_analyze: 分析项目结构
+ * - opencode_run: 使用 tmux 交互式会话运行 OpenCode 任务
+ * - opencode_status: 检查任务状态
+ * - opencode_kill: 终止任务
+ * - opencode_send: 发送输入（如确认信息）
  */
 
-import { exec, sessions_spawn } from "../tooltronic.js"
+import { exec, process } from "../tooltronic.js"
+
+// ============================================================================
+// 配置
+// ============================================================================
+
+const DEFAULT_TIMEOUT = 300000; // 5分钟
+const SESSION_PREFIX = "opencode-";
 
 // ============================================================================
 // Tool: opencode_run
 // ============================================================================
 
 /**
- * 在指定目录运行 OpenCode 命令
+ * 在 tmux 会话中运行 OpenCode 任务（交互式方式）
  * 
  * @param {Object} args
  * @param {string} args.command - 要执行的开发任务描述
  * @param {string} args.directory - 项目目录（可选，默认当前工作目录）
  * @param {string} args.model - 使用的模型（可选）
- * @param {boolean} args.continue_session - 是否继续上一个会话
- * @param {boolean} args.share - 是否分享会话
  * @returns {Promise<Object>}
  */
 async function opencode_run(args) {
   const {
     command,
     directory = process.cwd(),
-    model = null,
-    continue_session = false,
-    share = false
+    model = null
   } = args
 
-  // 构建命令
-  let cmd = `cd "${directory}" && opencode run "${command.replace(/"/g, '\\"')}" --format json`
+  // 生成唯一会话名
+  const sessionId = `${SESSION_PREFIX}${Date.now()}`
   
-  if (continue_session) {
-    cmd += " --continue"
-  }
-  
-  if (share) {
-    cmd += " --share"
-  }
-  
+  // 构建 OpenCode 命令
+  let opencodeCmd = `cd "${directory}" && opencode run "${command.replace(/"/g, '\\"')}" --format json`
   if (model) {
-    cmd += ` --model ${model}`
+    opencodeCmd += ` --model ${model}`
   }
 
   try {
-    const result = await exec({
-      command: cmd,
-      timeout: 300000, // 5分钟超时
+    // 1. 创建 tmux 会话（后台运行）
+    await exec({
+      command: `tmux new-session -d -s ${sessionId} "${opencodeCmd}"`,
       security: "allowlist"
     })
 
-    // 解析 JSON 输出
-    let output = result.stdout || result.stderr
-    
-    try {
-      // 尝试解析 JSON
-      const jsonOutput = JSON.parse(output)
-      return {
-        success: true,
-        output: jsonOutput,
-        session_url: jsonOutput.share_url || null
+    // 2. 等待任务完成（轮询检查输出）
+    const startTime = Date.now()
+    let output = ""
+    let isComplete = false
+
+    while (Date.now() - startTime < DEFAULT_TIMEOUT && !isComplete) {
+      await sleep(3000) // 每3秒检查一次
+
+      // 捕获 tmux 输出
+      const result = await exec({
+        command: `tmux capture-pane -p -t ${sessionId} -S -50`,
+        security: "allowlist"
+      })
+
+      output = result.stdout || ""
+
+      // 检查是否完成（看到 OpenCode 提示符）
+      if (output.includes("❯") || output.includes("›")) {
+        isComplete = true
       }
-    } catch {
-      // 如果不是 JSON，返回原始输出
-      return {
-        success: true,
-        output: output,
-        session_url: null
+
+      // 检查是否出错
+      if (output.toLowerCase().includes("error") && !output.includes("noReply")) {
+        isComplete = true
       }
     }
+
+    // 3. 获取最终输出
+    const finalResult = await exec({
+      command: `tmux capture-pane -p -t ${sessionId} -S -100`,
+      security: "allowlist"
+    })
+
+    // 4. 清理 tmux 会话
+    await exec({
+      command: `tmux kill-session -t ${sessionId} 2>/dev/null || true`,
+      security: "allowlist"
+    })
+
+    // 5. 解析输出
+    const cleanedOutput = cleanOutput(finalResult.stdout || "")
+
+    return {
+      success: !cleanedOutput.toLowerCase().includes("error"),
+      session_id: sessionId,
+      output: cleanedOutput,
+      truncated: cleanedOutput.length > 10000
+    }
+
   } catch (error) {
+    // 清理 tmux 会话
+    await exec({
+      command: `tmux kill-session -t ${sessionId} 2>/dev/null || true`,
+      security: "allowlist"
+    })
+
     return {
       success: false,
       error: error.message,
-      hint: "确保已安装 OpenCode CLI 并配置了 API Key"
+      session_id: sessionId,
+      hint: "确保 tmux 已安装且 OpenCode CLI 配置正确"
     }
   }
 }
 
 // ============================================================================
-// Tool: opencode_session
-// ============================================================================
-
-/**
- * 管理 OpenCode 会话
- * 
- * @param {Object} args
- * @param {string} args.action - 操作类型：list, get, continue, share
- * @param {string} args.session_id - 会话 ID（对于 get, continue 操作）
- * @param {number} args.max_count - 列出最多 N 个会话
- * @returns {Promise<Object>}
- */
-async function opencode_session(args) {
-  const { action, session_id = null, max_count = 10 } = args
-
-  switch (action) {
-    case "list":
-      return await list_sessions(max_count)
-    
-    case "get":
-      if (!session_id) {
-        return { success: false, error: "需要提供 session_id" }
-      }
-      return await get_session(session_id)
-    
-    case "continue":
-      if (!session_id) {
-        return { success: false, error: "需要提供 session_id" }
-      }
-      return await continue_session(session_id)
-    
-    case "share":
-      if (!session_id) {
-        return { success: false, error: "需要提供 session_id" }
-      }
-      return await share_session(session_id)
-    
-    default:
-      return { 
-        success: false, 
-        error: `未知的操作: ${action}`,
-        hint: "支持的 action: list, get, continue, share"
-      }
-  }
-}
-
-async function list_sessions(max_count) {
-  try {
-    const result = await exec({
-      command: `opencode session list --max-count ${max_count} --format json`,
-      security: "allowlist"
-    })
-    
-    return {
-      success: true,
-      sessions: JSON.parse(result.stdout || "[]")
-    }
-  } catch (error) {
-    return {
-      success: false,
-      error: error.message
-    }
-  }
-}
-
-async function get_session(session_id) {
-  try {
-    const result = await exec({
-      command: `opencode export ${session_id}`,
-      security: "allowlist"
-    })
-    
-    return {
-      success: true,
-      session: JSON.parse(result.stdout || "{}")
-    }
-  } catch (error) {
-    return {
-      success: false,
-      error: error.message
-    }
-  }
-}
-
-async function continue_session(session_id) {
-  // 返回继续会话的命令，用户可以在需要时执行
-  return {
-    success: true,
-    command: `opencode run --session ${session_id} "继续之前的任务"`,
-    session_id
-  }
-}
-
-async function share_session(session_id) {
-  try {
-    const result = await exec({
-      command: `opencode session share ${session_id}`,
-      security: "allowlist"
-    })
-    
-    return {
-      success: true,
-      share_url: result.stdout.trim() || null
-    }
-  } catch (error) {
-    return {
-      success: false,
-      error: error.message
-    }
-  }
-}
-
-// ============================================================================
-// Tool: opencode_analyze
+// Tool: opencode_background
 // ============================================================================
 
 /**
- * 分析项目结构并创建 AGENTS.md
+ * 在后台启动 OpenCode 任务（不等待完成）
  * 
  * @param {Object} args
+ * @param {string} args.command - 要执行的开发任务描述
  * @param {string} args.directory - 项目目录
  * @returns {Promise<Object>}
  */
-async function opencode_analyze(args) {
-  const { directory = process.cwd() } = args
+async function opencode_background(args) {
+  const { command, directory = process.cwd() } = args
+
+  const sessionId = `${SESSION_PREFIX}${Date.now()}`
+  const opencodeCmd = `cd "${directory}" && opencode run "${command.replace(/"/g, '\\"')}"`
 
   try {
-    // 运行 init 命令
-    const result = await exec({
-      command: `cd "${directory}" && opencode /init`,
-      timeout: 120000,
+    // 创建 tmux 会话
+    await exec({
+      command: `tmux new-session -d -s ${sessionId} "${opencodeCmd}"`,
       security: "allowlist"
     })
 
-    // 读取生成的 AGENTS.md
-    const agentsPath = `${directory}/AGENTS.md`
-    
-    try {
-      const agentsContent = await readFile(agentsPath)
-      return {
-        success: true,
-        agents_md: agentsContent,
-        message: "项目分析完成，AGENTS.md 已创建"
-      }
-    } catch {
-      return {
-        success: true,
-        message: "项目分析完成，但未找到 AGENTS.md",
-        output: result.stdout
-      }
+    return {
+      success: true,
+      session_id: sessionId,
+      message: `任务已在 tmux 会话 ${sessionId} 中启动`,
+      hint: "使用 opencode_status 检查进度，使用 opencode_output 获取输出"
     }
+
   } catch (error) {
     return {
       success: false,
       error: error.message,
-      hint: "确保目录存在且包含代码文件"
+      hint: "确保 tmux 已安装"
     }
   }
 }
 
 // ============================================================================
-// Tool: opencode_serve
+// Tool: opencode_status
 // ============================================================================
 
 /**
- * 启动 OpenCode 服务器（用于 SDK 连接）
+ * 检查 OpenCode 任务状态
  * 
  * @param {Object} args
- * @param {number} args.port - 端口（默认 4096）
- * @param {string} args.hostname - 主机名（默认 127.0.0.1）
+ * @param {string} args.session_id - tmux 会话 ID
  * @returns {Promise<Object>}
  */
-async function opencode_serve(args) {
-  const { port = 4096, hostname = "127.0.0.1" } = args
+async function opencode_status(args) {
+  const { session_id } = args
 
-  const cmd = `opencode serve --port ${port} --hostname ${hostname}`
+  try {
+    // 检查会话是否存在
+    const checkResult = await exec({
+      command: `tmux has-session -t ${session_id} 2>&1 && echo "running" || echo "not_found"`,
+      security: "allowlist"
+    })
+
+    const isRunning = checkResult.stdout.includes("running")
+
+    // 获取输出
+    let output = ""
+    if (isRunning) {
+      const captureResult = await exec({
+        command: `tmux capture-pane -p -t ${session_id} -S -30`,
+        security: "allowlist"
+      })
+      output = cleanOutput(captureResult.stdout || "")
+    }
+
+    return {
+      success: true,
+      session_id,
+      is_running: isRunning,
+      output: output,
+      prompt_visible: output.includes("❯") || output.includes("›")
+    }
+
+  } catch (error) {
+    return {
+      success: false,
+      error: error.message
+    }
+  }
+}
+
+// ============================================================================
+// Tool: opencode_output
+// ============================================================================
+
+/**
+ * 获取 OpenCode 任务输出
+ * 
+ * @param {Object} args
+ * @param {string} args.session_id - tmux 会话 ID
+ * @param {number} args.lines - 获取最后 N 行（默认 50）
+ * @returns {Promise<Object>}
+ */
+async function opencode_output(args) {
+  const { session_id, lines = 50 } = args
+
+  try {
+    const result = await exec({
+      command: `tmux capture-pane -p -t ${session_id} -S -${lines}`,
+      security: "allowlist"
+    })
+
+    return {
+      success: true,
+      session_id,
+      output: cleanOutput(result.stdout || "")
+    }
+
+  } catch (error) {
+    return {
+      success: false,
+      error: error.message
+    }
+  }
+}
+
+// ============================================================================
+// Tool: opencode_send
+// ============================================================================
+
+/**
+ * 向 OpenCode 发送输入（如确认 "y"）
+ * 
+ * @param {Object} args
+ * @param {string} args.session_id - tmux 会话 ID
+ * @param {string} args.input - 要发送的输入
+ * @returns {Promise<Object>}
+ */
+async function opencode_send(args) {
+  const { session_id, input = "y" } = args
+
+  try {
+    await exec({
+      command: `tmux send-keys -t ${session_id} "${input}" Enter`,
+      security: "allowlist"
+    })
+
+    return {
+      success: true,
+      message: `已向会话 ${session_id} 发送: ${input}`
+    }
+
+  } catch (error) {
+    return {
+      success: false,
+      error: error.message
+    }
+  }
+}
+
+// ============================================================================
+// Tool: opencode_kill
+// ============================================================================
+
+/**
+ * 终止 OpenCode 任务
+ * 
+ * @param {Object} args
+ * @param {string} args.session_id - tmux 会话 ID
+ * @returns {Promise<Object>}
+ */
+async function opencode_kill(args) {
+  const { session_id } = args
+
+  try {
+    await exec({
+      command: `tmux kill-session -t ${session_id}`,
+      security: "allowlist"
+    })
+
+    return {
+      success: true,
+      message: `会话 ${session_id} 已终止`
+    }
+
+  } catch (error) {
+    return {
+      success: false,
+      error: error.message
+    }
+  }
+}
+
+// ============================================================================
+// Tool: opencode_list
+// ============================================================================
+
+/**
+ * 列出所有 OpenCode 任务会话
+ * 
+ * @returns {Promise<Object>}
+ */
+async function opencode_list() {
+  try {
+    const result = await exec({
+      command: `tmux list-sessions -F "#{session_name}" 2>/dev/null | grep ${SESSION_PREFIX} || echo ""`,
+      security: "allowlist"
+    })
+
+    const sessions = result.stdout
+      .split("\n")
+      .filter(s => s && s.startsWith(SESSION_PREFIX))
+      .map(s => ({
+        session_id: s,
+        status: "running"
+      }))
+
+    return {
+      success: true,
+      sessions
+    }
+
+  } catch (error) {
+    return {
+      success: false,
+      error: error.message
+    }
+  }
+}
+
+// ============================================================================
+// 辅助函数
+// ============================================================================
+
+function cleanOutput(output) {
+  // 移除 ANSI 颜色码
+  let cleaned = output.replace(/\x1b\[[0-9;]*m/g, "")
   
-  // 在后台启动
-  await exec({
-    command: cmd,
-    background: true,
-    security: "allowlist"
-  })
-
-  return {
-    success: true,
-    message: `OpenCode 服务器已在 ${hostname}:${port} 启动`,
-    hint: "使用 SDK 连接: createOpencodeClient({ baseUrl: 'http://localhost:4096' })"
-  }
+  // 移除 tmux 状态行
+  cleaned = cleaned.replace(/\[%Y-%m-%d %H:%M\].*\n/g, "")
+  
+  // 移除多余空行
+  cleaned = cleaned.replace(/\n{3,}/g, "\n\n")
+  
+  return cleaned.trim()
 }
 
-// ============================================================================
-// Tool: opencode_quick_task (简化的任务执行)
-// ============================================================================
-
-/**
- * 快速执行简单的开发任务（委派给子 agent）
- * 
- * @param {Object} args
- * @param {string} args.task - 任务描述
- * @param {string} args.directory - 项目目录
- * @returns {Promise<Object>}
- */
-async function opencode_quick_task(args) {
-  const { task, directory = process.cwd() } = args
-
-  // 委派给专门的 OpenCode agent
-  const result = await sessions_spawn({
-    agentId: "opencode_dev",
-    task: `在目录 "${directory}" 中执行以下开发任务：\n\n${task}`,
-    label: `OpenCode: ${task.substring(0, 50)}...`,
-    timeoutSeconds: 600
-  })
-
-  return result
-}
-
-// ============================================================================
-// 工具函数辅助
-// ============================================================================
-
-async function readFile(path) {
-  const fs = await import("fs")
-  return fs.readFileSync(path, "utf-8")
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms))
 }
 
 // ============================================================================
@@ -316,24 +376,26 @@ async function readFile(path) {
 
 export const tools = {
   opencode_run,
-  opencode_session,
-  opencode_analyze,
-  opencode_serve,
-  opencode_quick_task
+  opencode_background,
+  opencode_status,
+  opencode_output,
+  opencode_send,
+  opencode_kill,
+  opencode_list
 }
 
 export const skill = {
   name: "opencode",
-  description: "使用 OpenCode AI 编码代理进行软件开发",
-  version: "1.0.0",
+  description: "使用 OpenCode AI 编码代理进行软件开发（通过 tmux 交互式会话）",
+  version: "2.0.0",
   author: "Clawdbot",
   
   triggers: [
     "opencode",
     "open code",
-    "帮我写代码",
     "AI 编程",
-    "编程代理"
+    "编程代理",
+    "帮我写代码"
   ],
   
   tools: Object.keys(tools),
@@ -341,7 +403,16 @@ export const skill = {
   default_config: {
     model: null,
     directory: process.cwd(),
-    timeout: 300000
+    timeout: 300000,
+    use_tmux: true
+  },
+  
+  info: {
+    prerequisites: [
+      "安装 OpenCode CLI: curl -fsSL https://opencode.ai/install | bash",
+      "配置 API Key: opencode auth login",
+      "安装 tmux（系统包管理器）"
+    ]
   }
 }
 
